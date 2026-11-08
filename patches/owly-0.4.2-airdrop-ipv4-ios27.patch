@@ -1,0 +1,296 @@
+diff -ruN a/crates/owly-airdrop/src/driver/mdns.rs b/crates/owly-airdrop/src/driver/mdns.rs
+--- a/crates/owly-airdrop/src/driver/mdns.rs	2026-11-08 09:48:47.140131644 +0800
++++ b/crates/owly-airdrop/src/driver/mdns.rs	2026-11-08 09:48:47.147831888 +0800
+@@ -125,12 +125,40 @@
+                 received = socket.recv_from(&mut buf) => {
+                     let Ok((n, from)) = received else { continue };
+                     let Some(from) = self.on_this_link(from) else { continue };
+-                    let Ok(query) = Message::decode(&buf[..n]) else { continue };
+-                    let Some(reply) = service.answer(&query, from.port() != MDNS_PORT) else { continue };
+-                    let to = if reply.unicast { from } else { group };
++                    let Ok(query) = Message::decode(&buf[..n]) else {
++                        tracing::debug!(bytes = n, "mDNS: query did not decode");
++                        continue
++                    };
++                    tracing::debug!(
++                        from = %from,
++                        response = query.response,
++                        questions = ?query.questions.iter()
++                            .map(|q| (q.name.to_string(), q.qtype, q.unicast))
++                            .collect::<Vec<_>>(),
++                        known_answers = ?query.answers.iter()
++                            .map(|r| (r.name.to_string(), r.rtype, r.ttl, format!("{:?}", r.data)))
++                            .collect::<Vec<_>>(),
++                        "mDNS: query"
++                    );
++                    let Some(reply) = service.answer(&query, from.port() != MDNS_PORT) else {
++                        tracing::debug!("mDNS: nothing to answer in that query");
++                        continue
++                    };
++                    let to = if reply.unicast {
++                        // A reply to a link-local peer needs the interface's
++                        // scope: recv_from leaves it 0 for some senders, and
++                        // send_to then fails with EINVAL (local patch).
++                        SocketAddrV6::new(*from.ip(), from.port(), 0, self.scope_id)
++                    } else {
++                        group
++                    };
+                     // RFC 6762 §6: a short random delay for shared records
+                     // isn't needed with one responder per link.
+-                    let _ = socket.send_to(&reply.message, to).await;
++                    if let Err(e) = socket.send_to(&reply.message, to).await {
++                        tracing::warn!("mDNS: could not send the reply to {to}: {e}");
++                    } else {
++                        tracing::debug!(to = %to, bytes = reply.message.len(), "mDNS: replied");
++                    }
+                 }
+             }
+         }
+diff -ruN a/crates/owly-airdrop/src/driver/staging.rs b/crates/owly-airdrop/src/driver/staging.rs
+--- a/crates/owly-airdrop/src/driver/staging.rs	2026-11-08 09:48:47.140260287 +0800
++++ b/crates/owly-airdrop/src/driver/staging.rs	2026-11-08 09:48:47.147917700 +0800
+@@ -133,7 +133,20 @@
+ #[cfg(target_os = "linux")]
+ fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
+     use nix::fcntl::{AT_FDCWD, RenameFlags, renameat2};
+-    renameat2(AT_FDCWD, from, AT_FDCWD, to, RenameFlags::RENAME_NOREPLACE).map_err(io::Error::from)
++    match renameat2(AT_FDCWD, from, AT_FDCWD, to, RenameFlags::RENAME_NOREPLACE) {
++        Ok(()) => Ok(()),
++        // Some filesystems (ntfs-3g and other FUSE ones) reject the flag
++        // outright with EINVAL, and more with EOPNOTSUPP: fall back to
++        // check-then-rename, which is what the non-Linux path does
++        // (local patch).
++        Err(nix::errno::Errno::EINVAL) | Err(nix::errno::Errno::EOPNOTSUPP) => {
++            if std::fs::symlink_metadata(to).is_ok() {
++                return Err(io::ErrorKind::AlreadyExists.into());
++            }
++            std::fs::rename(from, to)
++        }
++        Err(e) => Err(io::Error::from(e)),
++    }
+ }
+ 
+ /// Without an atomic no-replace rename, check first. The race is with the
+diff -ruN a/crates/owly-airdrop/src/proto/mdns.rs b/crates/owly-airdrop/src/proto/mdns.rs
+--- a/crates/owly-airdrop/src/proto/mdns.rs	2026-11-08 09:48:47.140636540 +0800
++++ b/crates/owly-airdrop/src/proto/mdns.rs	2026-11-08 09:48:47.149564259 +0800
+@@ -4,7 +4,7 @@
+ 
+ use std::collections::{BTreeMap, VecDeque};
+ use std::fmt;
+-use std::net::Ipv6Addr;
++use std::net::{Ipv4Addr, Ipv6Addr};
+ use std::time::{Duration, Instant};
+ 
+ pub const MDNS_PORT: u16 = 5353;
+@@ -421,6 +421,10 @@
+     pub port: u16,
+     /// The interface's link-local address.
+     pub addr: Ipv6Addr,
++    /// The interface's IPv4 address, when it has one: iOS asks for the
++    /// host's A record and ignores a responder that only answers AAAA
++    /// (local patch, see README.patch).
++    pub addr4: Option<Ipv4Addr>,
+     pub flags: u32,
+ }
+ 
+@@ -430,7 +434,7 @@
+     pub fn records(&self) -> Vec<Record> {
+         let instance = Name::instance(&self.instance);
+         let host = Name::host(&self.host);
+-        vec![
++        let mut out = vec![
+             Record {
+                 name: Name::service(),
+                 rtype: rtype::PTR,
+@@ -464,7 +468,18 @@
+                 ttl: HOST_TTL,
+                 data: RData::Aaaa(self.addr),
+             },
+-        ]
++        ];
++        if let Some(addr4) = self.addr4 {
++            let host = Name::host(&self.host);
++            out.push(Record {
++                name: host,
++                rtype: rtype::A,
++                cache_flush: true,
++                ttl: HOST_TTL,
++                data: RData::Other(addr4.octets().to_vec()),
++            });
++        }
++        out
+     }
+ 
+     /// An unsolicited response with every record (RFC 6762 §8.3).
+@@ -500,20 +515,30 @@
+         }
+         let records = self.records();
+         let [ptr, srv, txt, aaaa] = [0, 1, 2, 3].map(|i| &records[i]);
++        let a4 = records.get(4);
+         let mut answers: Vec<&Record> = Vec::new();
+         let mut additional: Vec<&Record> = Vec::new();
+         let wants = |q: &Question, t: u16| q.qtype == t || q.qtype == rtype::ANY;
+         for q in &query.questions {
+             if q.name == ptr.name && wants(q, rtype::PTR) {
+                 // RFC 6762 §7.1: skip what the asker already knows, with at
+-                // least half its TTL left.
+-                let known = query
+-                    .answers
+-                    .iter()
+-                    .any(|k| k.name == ptr.name && k.data == ptr.data && k.ttl >= ptr.ttl / 2);
++                // least half its TTL left. §5.4: that suppression is for
++                // multicast answers — a QU question, or a legacy unicast one,
++                // asks for a reply whether or not it already knows the answer
++                // (local patch: iOS sends QU with our own PTR as the known
++                // answer, and suppressing it left the receiver unlisted).
++                let known = !q.unicast
++                    && !legacy
++                    && query
++                        .answers
++                        .iter()
++                        .any(|k| k.name == ptr.name && k.data == ptr.data && k.ttl >= ptr.ttl / 2);
+                 if !known {
+                     answers.push(ptr);
+                     additional.extend([srv, txt, aaaa]);
++                    if let Some(a) = a4 {
++                        additional.push(a);
++                    }
+                 }
+             }
+             if q.name == srv.name {
+@@ -528,6 +553,11 @@
+             if q.name == aaaa.name && wants(q, rtype::AAAA) {
+                 answers.push(aaaa);
+             }
++            if let Some(a) = a4 {
++                if q.name == a.name && wants(q, rtype::A) {
++                    answers.push(a);
++                }
++            }
+         }
+         if answers.is_empty() {
+             return None;
+@@ -958,6 +988,7 @@
+             host: "owly-3fa9c01b22de".into(),
+             port: 8770,
+             addr: "fe80::1".parse().unwrap(),
++            addr4: None,
+             flags: RECEIVER_FLAGS,
+         }
+     }
+diff -ruN a/crates/owly-airdrop/tests/loopback.rs b/crates/owly-airdrop/tests/loopback.rs
+--- a/crates/owly-airdrop/tests/loopback.rs	2026-11-08 09:48:47.140988807 +0800
++++ b/crates/owly-airdrop/tests/loopback.rs	2026-11-08 09:48:47.149977982 +0800
+@@ -601,6 +601,7 @@
+             host: format!("owly-{instance}"),
+             port: PORT,
+             addr: veth.b.addr,
++            addr4: None,
+             flags: RECEIVER_FLAGS,
+         };
+         let _registration = Mdns::new(veth.b.index).register(service).await.unwrap();
+@@ -644,6 +645,7 @@
+             host: format!("owly-{instance}"),
+             port: PORT,
+             addr: veth.b.addr,
++            addr4: None,
+             flags: RECEIVER_FLAGS,
+         };
+         let start = Instant::now();
+diff -ruN a/crates/owly-cli/src/airdrop.rs b/crates/owly-cli/src/airdrop.rs
+--- a/crates/owly-cli/src/airdrop.rs	2026-11-08 09:48:47.141753144 +0800
++++ b/crates/owly-cli/src/airdrop.rs	2026-11-08 09:48:47.153964152 +0800
+@@ -10,8 +10,8 @@
+ 
+ use std::collections::BTreeSet;
+ use std::io;
+-use std::net::{Ipv6Addr, SocketAddrV6};
+-use std::path::PathBuf;
++use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV6};
++use std::path::{Path, PathBuf};
+ use std::process::ExitCode;
+ use std::time::Duration;
+ 
+@@ -123,6 +123,27 @@
+     }
+ }
+ 
++/// The interface's IPv4 address, when it has one. iOS asks for the host's A
++/// record and never lists a responder that only answers AAAA, so the receiver
++/// publishes what `ip -4` reports on its own interface (local patch).
++fn ipv4_of_interface(ifname: &str) -> Option<Ipv4Addr> {
++    let out = std::process::Command::new("ip")
++        .args(["-4", "-o", "addr", "show", "dev", ifname])
++        .output()
++        .ok()?;
++    if !out.status.success() {
++        return None;
++    }
++    let text = String::from_utf8_lossy(&out.stdout);
++    let mut tokens = text.split_whitespace();
++    while let Some(token) = tokens.next() {
++        if token == "inet" {
++            return tokens.next()?.split('/').next()?.parse().ok();
++        }
++    }
++    None
++}
++
+ /// `owly receive`.
+ pub async fn receive(bus: Option<&str>, args: ReceiveArgs) -> Result<ExitCode, String> {
+     let (iface, name) = args.on.resolve().map_err(|e| e.to_string())?;
+@@ -340,6 +361,35 @@
+     Ok(mdns::service_id(bytes))
+ }
+ 
++/// The service ID this receiver uses, kept across runs so a phone doesn't
++/// keep a dead `_airdrop._tcp` instance for every restart (local patch):
++/// `OWLY_SERVICE_ID` wins, then `$state/service-id`, else a fresh one is
++/// written there.
++fn stable_service_id(state: &Path) -> io::Result<String> {
++    if let Some(id) = std::env::var_os("OWLY_SERVICE_ID") {
++        let id = id.to_string_lossy().into_owned();
++        if is_service_id(&id) {
++            return Ok(id);
++        }
++        return Err(io::Error::other("OWLY_SERVICE_ID is not 12 hex digits"));
++    }
++    let path = state.join("service-id");
++    if let Ok(saved) = std::fs::read_to_string(&path) {
++        let saved = saved.trim().to_string();
++        if is_service_id(&saved) {
++            return Ok(saved);
++        }
++    }
++    let id = random_service_id()?;
++    std::fs::create_dir_all(state)?;
++    let _ = std::fs::write(&path, &id);
++    Ok(id)
++}
++
++fn is_service_id(s: &str) -> bool {
++    s.len() == 12 && s.bytes().all(|b| b.is_ascii_hexdigit())
++}
++
+ /// BLE-5: a fresh tag per advert.
+ fn random_tag() -> io::Result<[u8; 3]> {
+     let mut tag = [0; 3];
+@@ -611,7 +661,8 @@
+     let (receiver, mut events) = Receiver::bind(addr, &identity, Options::new(config, dir)).await?;
+     tokio::spawn(receiver.run());
+ 
+-    let service_id = random_service_id()?;
++    let service_id = stable_service_id(&state)?;
++    let addr4 = ipv4_of_interface(&iface.name);
+     let _registration = if no_mdns {
+         None
+     } else {
+@@ -620,6 +671,7 @@
+             host: format!("owly-{service_id}"),
+             port,
+             addr: iface.addr,
++            addr4,
+             flags,
+         };
+         Some(
